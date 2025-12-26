@@ -116,7 +116,7 @@ def _compute_topology_features(
 
 
 def _resample_frame(
-    df: pd.DataFrame, freq_minutes: int, delay_threshold: Optional[float] = None
+    df: pd.DataFrame, freq_minutes: int, delay_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Resamples the dataframe to a uniform frequency.
@@ -323,6 +323,7 @@ class DelayGraphDataset(Dataset):
         delay_percentile: float = 85.0,
         use_traceroute: bool = True,
         topology_weight: float = 0.4,
+        column_delay: str = "Atraso(ms)",
     ) -> None:
         if window_size < 2:
             raise ValueError("window_size must be >= 2")
@@ -332,6 +333,7 @@ class DelayGraphDataset(Dataset):
         self.links = self._discover_links(links)
         self.use_traceroute = use_traceroute
         self.topology_weight = topology_weight
+        self.column_delay = column_delay
         print(
             f"[DEBUG] Found {len(self.links)} links: {self.links[:3]}{'...' if len(self.links) > 3 else ''}"
         )
@@ -369,7 +371,7 @@ class DelayGraphDataset(Dataset):
 
         if delay_threshold is None:
             all_delays = pd.concat(
-                [df["Atraso(ms)"] for df in raw_frames.values()], ignore_index=True
+                [df[self.column_delay] for df in raw_frames.values()], ignore_index=True
             )
             delay_threshold = float(all_delays.quantile(delay_percentile / 100.0))
             print(
@@ -383,7 +385,7 @@ class DelayGraphDataset(Dataset):
 
         print("[DEBUG] Resampling data...")
         resampled = {
-            link: _resample_frame(df, freq_minutes, delay_threshold)
+            link: _resample_frame(df, freq_minutes, delay_threshold, self.column_delay)
             for link, df in raw_frames.items()
         }
         total_resampled = sum(len(df) for df in resampled.values())
@@ -436,11 +438,11 @@ class DelayGraphDataset(Dataset):
             if not file_path.exists():
                 raise FileNotFoundError(f"Missing file for link {link}: {file_path}")
             df = pd.read_csv(file_path, parse_dates=["Timestamp"])
-            if "Atraso(ms)" not in df.columns:
-                raise ValueError(f"Column 'Atraso(ms)' not found in {file_path}")
+            if self.column_delay not in df.columns:
+                raise ValueError(f"Column '{self.column_delay}' not found in {file_path}")
 
             if self.use_traceroute:
-                required_cols = ["Timestamp", "Atraso(ms)"]
+                required_cols = ["Timestamp", self.column_delay]
                 if "Num_Hops" in df.columns:
                     optional_cols = ["Num_Hops", "Path_IPs", "Path_Hostnames"]
                 elif "Total_Hops" in df.columns:
@@ -454,9 +456,9 @@ class DelayGraphDataset(Dataset):
                 ]
                 df = df[available_cols]
             else:
-                df = df[["Timestamp", "Atraso(ms)"]]
+                df = df[["Timestamp", self.column_delay]]
 
-            df = df.dropna(subset=["Timestamp", "Atraso(ms)"])
+            df = df.dropna(subset=["Timestamp", self.column_delay])
             frames[link] = df
         return frames
 
@@ -523,8 +525,8 @@ class DelayGraphDataset(Dataset):
         hops_frames = []
 
         for link, frame in frames.items():
-            clean_frame = frame[["Timestamp", "Atraso(ms)"]].copy()
-            ren = clean_frame.rename(columns={"Atraso(ms)": f"delay_{link}"})
+            clean_frame = frame[["Timestamp", self.column_delay]].copy()
+            ren = clean_frame.rename(columns={self.column_delay: f"delay_{link}"})
             ren = ren.set_index("Timestamp")
             delay_frames.append(ren)
 
@@ -727,24 +729,44 @@ class DelayGraphDataset(Dataset):
         df.to_csv(path, index=False)
 
 
-def temporal_split(
-    dataset: DelayGraphDataset,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-) -> GraphSplit:
-    if not (0.0 < train_ratio < 1.0) or not (0.0 <= val_ratio < 1.0):
-        raise ValueError("Ratios must be in (0,1)")
-    if train_ratio + val_ratio >= 1.0:
-        raise ValueError("train_ratio + val_ratio must be < 1")
-    n_samples = len(dataset)
-    train_end = int(n_samples * train_ratio)
-    val_end = train_end + int(n_samples * val_ratio)
-    indices = torch.arange(n_samples)
-    train_indices = indices[:train_end]
-    val_indices = indices[train_end:val_end]
-    test_indices = indices[val_end:]
-    return GraphSplit(
-        torch.utils.data.Subset(dataset, train_indices.tolist()),
-        torch.utils.data.Subset(dataset, val_indices.tolist()),
-        torch.utils.data.Subset(dataset, test_indices.tolist()),
-    )
+def _resample_frame(
+    df: pd.DataFrame, freq_minutes: int, delay_threshold: Optional[float] = None, column_delay: str = "Atraso(ms)"
+) -> pd.DataFrame:
+    """
+    Resamples the dataframe to a uniform frequency.
+    -----------------------------------------------
+    Preserves numeric columns such as column_delay and Num_Hops after resampling.
+
+    Args:
+        df: DataFrame with columns Timestamp, column_delay and optionally Num_Hops
+        freq_minutes: Resampling frequency in minutes
+        delay_threshold: Fixed threshold for high delay(ms). If None, will be calculated by percentile later.
+        column_delay: Name of the delay column to use
+    """
+    frame = df.copy()
+    frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], utc=False)
+    frame = frame.sort_values("Timestamp")
+    frame = frame.set_index("Timestamp")
+    rule = f"{int(freq_minutes)}min"
+
+    numeric_cols = frame.select_dtypes(include=[np.number]).columns.tolist()
+
+    agg = frame[numeric_cols].resample(rule).mean()
+
+    if column_delay in agg.columns:
+        agg[column_delay] = agg[column_delay].interpolate(
+            method="linear", limit_direction="both"
+        )
+        agg[column_delay] = agg[column_delay].ffill().bfill()
+
+    if "Num_Hops" in agg.columns:
+        agg["Num_Hops"] = agg["Num_Hops"].interpolate(
+            method="linear", limit_direction="both"
+        )
+        agg["Num_Hops"] = agg["Num_Hops"].ffill().bfill()
+
+    if delay_threshold is not None and column_delay in agg.columns:
+        agg["high_delay"] = (agg[column_delay] > delay_threshold).astype(int)
+    agg = agg.dropna(subset=[column_delay], how="all")
+    agg = agg.reset_index()
+    return agg
