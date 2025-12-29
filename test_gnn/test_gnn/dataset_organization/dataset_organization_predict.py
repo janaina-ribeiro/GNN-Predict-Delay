@@ -177,16 +177,13 @@ def process_pair(pair_name, delay_file, trace_file):
             tolerance=pd.Timedelta("80min"),
         )
 
-        merged["high_delay"] = (merged["Atraso(ms)"] > 60).astype(int)
+        # Removed 'high_delay' column as requested
 
         output_file = OUTPUT_DIR / f"dataset_{pair_name}_links_hops.csv"
         merged.to_csv(output_file, index=False)
 
         print(f"   File generated: {output_file}")
         print(f"   Total records processed: {len(merged)}")
-        print(
-            f"   Records identified with high delay: {merged['high_delay'].sum()}"
-        )
         print(f"   Traceroutes processed: {len(df_links)}")
         print(f"   Columns in dataset: {list(merged.columns)}")
 
