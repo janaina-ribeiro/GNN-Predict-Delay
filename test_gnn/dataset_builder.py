@@ -321,7 +321,6 @@ class DelayGraphDataset(Dataset):
         limit_samples: Optional[int] = None,
         delay_threshold: Optional[float] = None,
         delay_percentile: float = 85.0,
-        use_traceroute: bool = True,
         topology_weight: float = 0.4,
         column_delay: str = "Atraso(ms)",
     ) -> None:
@@ -331,29 +330,22 @@ class DelayGraphDataset(Dataset):
         if not self.root.exists():
             raise FileNotFoundError(f"Data directory not found: {self.root}")
         self.links = self._discover_links(links)
-        self.use_traceroute = use_traceroute
         self.topology_weight = topology_weight
         self.column_delay = column_delay
         print(
             f"[DEBUG] Found {len(self.links)} links: {self.links[:3]}{'...' if len(self.links) > 3 else ''}"
         )
-        print(
-            f"[DEBUG] Traceroute features: {'enabled' if use_traceroute else 'disabled'}"
-        )
+        print(f"[DEBUG] Traceroute features: always enabled (mandatory)")
         raw_frames = self._load_frames()
         print(f"[DEBUG] Loaded {len(raw_frames)} raw frames (showing first 2)")
         for link, df in list(raw_frames.items())[:2]:
             print(f"[DEBUG]   - {link}: {len(df)} rows")
 
-        if self.use_traceroute:
-            self.topo_features = _compute_topology_features(raw_frames)
-            self.path_similarity = self._compute_path_similarity_matrix(raw_frames)
-            print(
-                f"[DEBUG] Computed topology features for {len(self.topo_features)} links"
-            )
-        else:
-            self.topo_features = None
-            self.path_similarity = None
+        self.topo_features = _compute_topology_features(raw_frames)
+        self.path_similarity = self._compute_path_similarity_matrix(raw_frames)
+        print(
+            f"[DEBUG] Computed topology features for {len(self.topo_features)} links"
+        )
         freq_minutes = (
             int(
                 round(
@@ -441,22 +433,18 @@ class DelayGraphDataset(Dataset):
             if self.column_delay not in df.columns:
                 raise ValueError(f"Column '{self.column_delay}' not found in {file_path}")
 
-            if self.use_traceroute:
-                required_cols = ["Timestamp", self.column_delay]
-                if "Num_Hops" in df.columns:
-                    optional_cols = ["Num_Hops", "Path_IPs", "Path_Hostnames"]
-                elif "Total_Hops" in df.columns:
-                    df = df.rename(columns={"Total_Hops": "Num_Hops"})
-                    optional_cols = ["Num_Hops", "Path_IPs", "Path_Hostnames"]
-                else:
-                    optional_cols = ["Path_IPs", "Path_Hostnames"]
+            # Traceroute features são obrigatórias
+            if "Num_Hops" not in df.columns and "Total_Hops" not in df.columns:
+                raise ValueError(f"Column 'Num_Hops' or 'Total_Hops' not found in {file_path}, traceroute features are mandatory.")
+            if "Total_Hops" in df.columns and "Num_Hops" not in df.columns:
+                df = df.rename(columns={"Total_Hops": "Num_Hops"})
+            if "Path_IPs" not in df.columns:
+                raise ValueError(f"Column 'Path_IPs' not found in {file_path}, traceroute features are mandatory.")
 
-                available_cols = required_cols + [
-                    col for col in optional_cols if col in df.columns
-                ]
-                df = df[available_cols]
-            else:
-                df = df[["Timestamp", self.column_delay]]
+            required_cols = ["Timestamp", self.column_delay, "Num_Hops", "Path_IPs"]
+            if "Path_Hostnames" in df.columns:
+                required_cols.append("Path_Hostnames")
+            df = df[[col for col in required_cols if col in df.columns]]
 
             df = df.dropna(subset=["Timestamp", self.column_delay])
             frames[link] = df
